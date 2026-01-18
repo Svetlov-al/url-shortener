@@ -6,3 +6,9 @@ http_server:
   idle_timeout: 60s
   user: "admin"
   password: "admin"
+clients:
+  sso:
+    address: "localhost:50051"
+    timeout: 2s
+    retries_count: 3
+app_secret: "dev-secret"

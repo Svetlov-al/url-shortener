@@ -1,37 +1,42 @@
 package tests
 
 import (
+	"context"
+	"io"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"os"
 	"path"
 	"testing"
+	"time"
 
 	"github.com/brianvoe/gofakeit/v6"
 	"github.com/gavv/httpexpect/v2"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/require"
 
 	"url-shortener/internal/http-server/handlers/url/save"
+	"url-shortener/internal/http-server/router"
 	"url-shortener/internal/lib/api"
 	"url-shortener/internal/lib/random"
+	"url-shortener/internal/storage/sqlite"
 )
 
 const (
-	host = "localhost:8082"
+	testAppSecret = "dev-secret"
 )
 
 func TestURLShortener_HappyPath(t *testing.T) {
-	u := url.URL{
-		Scheme: "http",
-		Host:   host,
-	}
-	e := httpexpect.Default(t, u.String())
+	e, _ := newTestClient(t)
 
 	e.POST("/url").
 		WithJSON(save.Request{
 			URL:   gofakeit.URL(),
 			Alias: random.NewRandomString(10),
 		}).
-		WithBasicAuth("admin", "admin").
+		WithHeader("Authorization", "Bearer "+makeHS256JWT(t, testAppSecret, 1, time.Now().Add(10*time.Minute))).
 		Expect().
 		Status(200).
 		JSON().Object().
@@ -66,12 +71,7 @@ func TestURLShortener_SaveRedirectDelete(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			u := url.URL{
-				Scheme: "http",
-				Host:   host,
-			}
-
-			e := httpexpect.Default(t, u.String())
+			e, baseURL := newTestClient(t)
 
 			// Save
 
@@ -80,7 +80,7 @@ func TestURLShortener_SaveRedirectDelete(t *testing.T) {
 					URL:   tc.url,
 					Alias: tc.alias,
 				}).
-				WithBasicAuth("admin", "admin").
+				WithHeader("Authorization", "Bearer "+makeHS256JWT(t, testAppSecret, 1, time.Now().Add(10*time.Minute))).
 				Expect().Status(http.StatusOK).
 				JSON().Object()
 
@@ -104,27 +104,74 @@ func TestURLShortener_SaveRedirectDelete(t *testing.T) {
 
 			// Redirect
 
-			testRedirect(t, alias, tc.url)
+			testRedirect(t, baseURL, alias, tc.url)
 
 			// Delete
 
 			e.DELETE("/"+path.Join("url", alias)).
-				WithBasicAuth("admin", "admin").
+				WithHeader("Authorization", "Bearer "+makeHS256JWT(t, testAppSecret, 1, time.Now().Add(10*time.Minute))).
 				Expect().Status(http.StatusNoContent)
 
 			// Redirect
 
-			testRedirectNotFound(t, alias)
+			testRedirectNotFound(t, baseURL, alias)
 		})
 	}
 }
 
-func testRedirect(t *testing.T, alias string, urlToRedirect string) {
-	u := url.URL{
-		Scheme: "http",
-		Host:   host,
-		Path:   alias,
-	}
+type fakeSSO struct{}
+
+func (fakeSSO) IsAdmin(_ context.Context, userID int64) (bool, error) {
+	return userID == 1, nil
+}
+
+func newTestClient(t *testing.T) (*httpexpect.Expect, string) {
+	t.Helper()
+
+	dbPath := tempDBPath(t)
+	st, err := sqlite.New(dbPath)
+	require.NoError(t, err)
+
+	log := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	r := router.New(log, st, fakeSSO{}, testAppSecret, 0)
+
+	srv := httptest.NewServer(r)
+	t.Cleanup(srv.Close)
+
+	e := httpexpect.Default(t, srv.URL)
+	e.Builder(func(req *httpexpect.Request) {
+		req.WithHeader("Content-Type", "application/json")
+	})
+	return e, srv.URL
+}
+
+func tempDBPath(t *testing.T) string {
+	t.Helper()
+	f, err := os.CreateTemp("", "url-shortener-*.db")
+	require.NoError(t, err)
+	path := f.Name()
+	require.NoError(t, f.Close())
+	t.Cleanup(func() { _ = os.Remove(path) })
+	return path
+}
+
+func makeHS256JWT(t *testing.T, secret string, userID int64, exp time.Time) string {
+	t.Helper()
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": userID,
+		"exp":     exp.Unix(),
+	})
+
+	signed, err := token.SignedString([]byte(secret))
+	require.NoError(t, err)
+	return signed
+}
+
+func testRedirect(t *testing.T, baseURL string, alias string, urlToRedirect string) {
+	u, err := url.Parse(baseURL)
+	require.NoError(t, err)
+	u.Path = alias
 
 	redirectedToURL, err := api.GetRedirect(u.String())
 	require.NoError(t, err)
@@ -132,13 +179,11 @@ func testRedirect(t *testing.T, alias string, urlToRedirect string) {
 	require.Equal(t, urlToRedirect, redirectedToURL)
 }
 
-func testRedirectNotFound(t *testing.T, alias string) {
-	u := url.URL{
-		Scheme: "http",
-		Host:   host,
-		Path:   alias,
-	}
+func testRedirectNotFound(t *testing.T, baseURL string, alias string) {
+	u, err := url.Parse(baseURL)
+	require.NoError(t, err)
+	u.Path = alias
 
-	_, err := api.GetRedirect(u.String())
+	_, err = api.GetRedirect(u.String())
 	require.ErrorIs(t, err, api.ErrInvalidStatusCode)
 }
